@@ -1,0 +1,10 @@
+[package]
+name = "esapi-rust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+env_logger = "0.11.8"
+log = "0.4.27"
+tss-esapi = "7.6.0"
