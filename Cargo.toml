@@ -16,4 +16,5 @@ p384 = { version = "0.13.1", default-features = false, features = [
     "std",
     "arithmetic",
 ] }
+sha2 = "0.10.9"
 tss-esapi = "7.6.0"
