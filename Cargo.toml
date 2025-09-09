@@ -11,6 +11,7 @@ log = "0.4.27"
 p256 = { version = "0.13.2", default-features = false, features = [
     "arithmetic",
     "std",
+    "ecdsa",
 ] }
 p384 = { version = "0.13.1", default-features = false, features = [
     "std",
