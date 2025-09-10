@@ -1,10 +1,7 @@
 use std::str::FromStr;
 
 use anyhow::Context;
-use p256::{
-    ecdsa::{self, signature},
-    elliptic_curve::sec1::FromEncodedPoint,
-};
+use p256::{ecdsa, elliptic_curve::sec1::FromEncodedPoint};
 use tss_esapi::{
     TctiNameConf,
     attributes::ObjectAttributesBuilder,
@@ -17,8 +14,8 @@ use tss_esapi::{
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        Attest, Auth, CreateKeyResult, CreatePrimaryKeyResult, Data, Digest, EccParameter,
-        EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, Nonce, PcrSelectionList,
+        Attest, Auth, CreateKeyResult, CreatePrimaryKeyResult, Data, Digest, DigestList,
+        EccParameter, EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, Nonce,
         PcrSelectionListBuilder, PcrSlot, Public, PublicEccParameters, PublicEccParametersBuilder,
         Signature, SignatureScheme, SymmetricDefinitionObject,
     },
@@ -41,6 +38,19 @@ impl std::str::FromStr for AlgoType {
         }
     }
 }
+
+// Source: TCG EK Credential Profile for TPM Family 2.0; Level 0 Version 2.5 Revision 2
+// Section B.6
+const POLICY_A_SHA384: [u8; 48] = [
+    0x8b, 0xbf, 0x22, 0x66, 0x53, 0x7c, 0x17, 0x1c, 0xb5, 0x6e, 0x40, 0x3c, 0x4d, 0xc1, 0xd4, 0xb6,
+    0x4f, 0x43, 0x26, 0x11, 0xdc, 0x38, 0x6e, 0x6f, 0x53, 0x20, 0x50, 0xc3, 0x27, 0x8c, 0x93, 0x0e,
+    0x14, 0x3e, 0x8b, 0xb1, 0x13, 0x38, 0x24, 0xcc, 0xb4, 0x31, 0x05, 0x38, 0x71, 0xc6, 0xdb, 0x53,
+];
+const POLICY_C_SHA384: [u8; 48] = [
+    0xd6, 0x03, 0x2c, 0xe6, 0x1f, 0x2f, 0xb3, 0xc2, 0x40, 0xeb, 0x3c, 0xf6, 0xa3, 0x32, 0x37, 0xef,
+    0x2b, 0x6a, 0x16, 0xf4, 0x29, 0x3c, 0x22, 0xb4, 0x55, 0xe2, 0x61, 0xcf, 0xfd, 0x21, 0x7a, 0xd5,
+    0xb4, 0x94, 0x7c, 0x2d, 0x73, 0xe6, 0x30, 0x05, 0xee, 0xd2, 0xdc, 0x2b, 0x35, 0x93, 0xd1, 0x65,
+];
 
 /// <https://trustedcomputinggroup.org/wp-content/uploads/TCG-EK-Credential-Profile-for-TPM-Family-2.0-Level-0-Version-2.6_pub.pdf#page=44>
 fn create_ek_low_p256(ctx: &mut tss_esapi::Context) -> anyhow::Result<CreatePrimaryKeyResult> {
@@ -246,6 +256,21 @@ fn main() -> anyhow::Result<()> {
                 .to_sec1_bytes(),
         };
 
+        let (policy_hashing_algo, digest_list) = match algo_type {
+            AlgoType::P256 => (HashingAlgorithm::Sha256, DigestList::new()),
+            AlgoType::P384 => (
+                HashingAlgorithm::Sha384,
+                ({
+                    let mut list = DigestList::new();
+                    list.add(Digest::try_from(POLICY_A_SHA384.as_slice()).unwrap())
+                        .unwrap();
+                    list.add(Digest::try_from(POLICY_C_SHA384.as_slice()).unwrap())
+                        .unwrap();
+                    list
+                }),
+            ),
+        };
+
         println!(">> Ek:\n{}", AsOpensslKey(&sec1));
 
         let session = ctx
@@ -256,7 +281,7 @@ fn main() -> anyhow::Result<()> {
                     None,
                     tss_esapi::constants::SessionType::Policy,
                     tss_esapi::structures::SymmetricDefinition::AES_128_CFB,
-                    HashingAlgorithm::Sha256,
+                    policy_hashing_algo,
                 )
                 .map(|session| session.expect("session should not be none"))
             })
@@ -271,20 +296,8 @@ fn main() -> anyhow::Result<()> {
         ctx.tr_sess_set_attributes(session, session_attr, session_attr_mask)
             .context("failed to set session attributes")?;
 
-        ctx.execute_with_sessions((Some(AuthSession::Password), None, None), |ctx| {
-            ctx.policy_secret(
-                PolicySession::try_from(session)
-                    .expect("Failed to convert auth session to policy session"),
-                AuthHandle::Endorsement,
-                Nonce::default(),
-                Digest::default(), // cp_hash_a,
-                Nonce::default(),  // policy_ref,
-                None,              // expiration,
-            )
-            .context("failed to execute policy secret 1")
-        })?;
-
         ctx.execute_with_sessions((Some(session), None, None), |ctx| -> anyhow::Result<()> {
+            satisfy_ek_policy(ctx, &digest_list, session)?;
             let child = create_child(ctx, primary.key_handle).context("failed to create child")?;
 
             let Public::Ecc { unique, .. } = &child.out_public else {
@@ -297,19 +310,7 @@ fn main() -> anyhow::Result<()> {
                 AsOpensslKey(&attestation_key.to_sec1_bytes())
             );
 
-            ctx.execute_with_sessions((Some(AuthSession::Password), None, None), |ctx| {
-                ctx.policy_secret(
-                    PolicySession::try_from(session)
-                        .expect("Failed to convert auth session to policy session"),
-                    AuthHandle::Endorsement,
-                    Nonce::default(),
-                    Digest::default(), // cp_hash_a,
-                    Nonce::default(),  // policy_ref,
-                    None,              // expiration,
-                )
-                .context("failed to execute policy secret 2")
-            })?;
-
+            satisfy_ek_policy(ctx, &digest_list, session)?;
             let child_handle = ctx
                 .load(primary.key_handle, child.out_private, child.out_public)
                 .context("failed to load child key")?;
@@ -354,6 +355,37 @@ fn main() -> anyhow::Result<()> {
 
         Ok(())
     })
+}
+
+fn satisfy_ek_policy(
+    ctx: &mut tss_esapi::Context,
+    digest_list: &DigestList,
+    session: AuthSession,
+) -> Result<(), anyhow::Error> {
+    ctx.execute_with_sessions((Some(AuthSession::Password), None, None), |ctx| {
+        ctx.policy_secret(
+            PolicySession::try_from(session)
+                .expect("Failed to convert auth session to policy session"),
+            AuthHandle::Endorsement,
+            Nonce::default(),
+            Digest::default(), // cp_hash_a,
+            Nonce::default(),  // policy_ref,
+            None,              // expiration,
+        )
+        .context("failed to execute policy secret 1")
+    })?;
+    if !digest_list.is_empty() {
+        ctx.execute_without_session(|ctx| -> anyhow::Result<()> {
+            ctx.policy_or(
+                PolicySession::try_from(session)
+                    .expect("failed to convert auth session to policy session"),
+                digest_list.clone(),
+            )
+            .context("failed to policy_or")
+        })?
+    };
+
+    Ok(())
 }
 
 fn ecc_point_to_p256_key(ecc: &EccPoint) -> anyhow::Result<p256::PublicKey> {
